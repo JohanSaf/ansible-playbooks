@@ -1,0 +1,189 @@
+# yamllint disable rule:line-length
+---
+# Run with (don't forget the trailing comma)
+# ansible-playbook -u username -i "new.server.example.com," --key-file ~/.ssh/id_ed25519 -k -K --extra-vars "firewall_ip=192.0.2.123" debian.yml
+- name: Initial server configuration
+  hosts: all
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Configuration
+      become_method: ansible.builtin.su
+      block:
+        - name: Update apt and install any upgrades
+          ansible.builtin.raw: "apt update && apt upgrade -y"
+          changed_when: false
+
+        - name: Install Python
+          ansible.builtin.raw: "apt -y install python3"
+          changed_when: false
+
+        - name: Gather facts
+          ansible.builtin.gather_facts:
+
+        - name: Install required software
+          ansible.builtin.apt:
+            pkg:
+              - qemu-guest-agent
+              - sudo
+              - systemd-timesyncd
+              - unattended-upgrades
+
+        - name: Ensure services are enabled
+          ansible.builtin.systemd_service:
+            name: "{{ item.name }}"
+            enabled: true
+          with_items:
+            - { name: "nftables" }
+            - { name: "qemu-guest-agent" }
+
+        - name: Enable NTP via timedatectl
+          ansible.builtin.command: "timedatectl set-ntp true"
+          changed_when: false
+
+        - name: Upload SSH keys
+          ansible.posix.authorized_key:
+            user: "{{ ansible_ssh_user }}"
+            state: present
+            exclusive: true
+            key: "{{ item.key }}"
+          with_items:
+            - { key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIjJlV/8ZzrnDJtB/KxU72oJzgDBHK0qcBqHY9rNkQjT johan@mbp.local" }
+
+        - name: Configure sshd
+          ansible.builtin.copy:
+            content: |
+              AllowAgentForwarding no
+              AllowTcpForwarding no
+              ChallengeResponseAuthentication no
+              UseDNS no
+              PasswordAuthentication no
+              PermitRootLogin no
+              PrintMotd no
+              VersionAddendum none
+              X11Forwarding no
+            dest: "/etc/ssh/sshd_config.d/local_settings.conf"
+            owner: root
+            group: root
+            mode: "0600"
+
+        - name: Configure sudo
+          ansible.builtin.copy:
+            content: "%sudo ALL=(ALL) NOPASSWD: ALL"
+            dest: "/etc/sudoers.d/local_settings"
+            owner: root
+            group: root
+            mode: "0600"
+
+        - name: Configure nftables
+          ansible.builtin.copy:
+            content: |
+              #!/usr/bin/nft -f
+
+              flush ruleset
+
+              table inet filter {
+                chain input {
+                  type filter hook input priority 0; policy drop;
+                  iif "lo" counter accept
+                  ct state { related, established } counter accept
+                  ct state invalid counter drop
+                  ip protocol icmp counter accept
+                  ip6 nexthdr icmpv6 counter accept
+                  tcp dport 22 ct state { new, established } counter jump ssh
+                  counter comment "dropped packets"
+                }
+
+                chain forward {
+                  type filter hook forward priority 0; policy drop;
+                  counter comment "dropped packets"
+                }
+
+                chain output {
+                  type filter hook output priority 0; policy accept;
+                }
+
+                chain ssh {
+                  ip saddr {{ firewall_ip }} counter accept
+                  counter reject
+                }
+              }
+            dest: "/etc/nftables.conf"
+            owner: root
+            group: root
+            mode: "0600"
+
+        - name: Configure unattended upgrades
+          ansible.builtin.copy:
+            content: |
+              Unattended-Upgrade::Origins-Pattern {
+                "origin=Debian,codename=${distro_codename}-updates";
+                "origin=Debian,codename=${distro_codename},label=Debian";
+                "origin=Debian,codename=${distro_codename},label=Debian-Security";
+                "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+              };
+              Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+              Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+              Unattended-Upgrade::Remove-Unused-Dependencies "true";
+              Unattended-Upgrade::Automatic-Reboot "true";
+              Unattended-Upgrade::Automatic-Reboot-Time "03:00";
+            dest: "/etc/apt/apt.conf.d/50unattended-upgrades"
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Enable unattended upgrades
+          ansible.builtin.copy:
+            content: |
+              APT::Periodic::Update-Package-Lists "1";
+              APT::Periodic::Unattended-Upgrade "1";
+            dest: "/etc/apt/apt.conf.d/20auto-upgrades"
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Ensure user is in correct groups
+          ansible.builtin.user:
+            name: "{{ ansible_ssh_user }}"
+            append: true
+            groups: "sudo"
+
+        - name: Generate and save password for local user
+          ansible.builtin.set_fact:
+            user_password: "{{
+                lookup('ansible.builtin.password', 'creds_user.txt', chars=['ascii_letters', 'digits'], length=16) }}"
+
+        - name: Change user password
+          ansible.builtin.user:
+            name: "{{ ansible_ssh_user }}"
+            state: present
+            password: "{{ user_password | trim | password_hash('sha512') }}"
+
+        - name: Generate and save password for root user
+          ansible.builtin.set_fact:
+            root_password: "{{
+                lookup('ansible.builtin.password', 'creds_root.txt', chars=['ascii_letters', 'digits'], length=16) }}"
+
+        - name: Change root password
+          ansible.builtin.user:
+            name: root
+            state: present
+            password: "{{ root_password | trim | password_hash('sha512') }}"
+
+    - name: Reboot
+      become_method: ansible.builtin.sudo
+      block:
+        - name: Set sudo password
+          ansible.builtin.set_fact:
+            ansible_become_password: "{{ user_password }}"
+
+        - name: Reset the ssh connection (logging out/in) to apply new user settings
+          ansible.builtin.meta:
+            reset_connection
+
+        - name: Reboot
+          ansible.builtin.reboot:
+            msg: "Reboot after initial server configuration"
+
+# vim: ft=yaml.ansible

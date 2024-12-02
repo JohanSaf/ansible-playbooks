@@ -1,0 +1,162 @@
+# yamllint disable rule:line-length
+---
+# Run with (don't forget the trailing comma)
+# ansible-playbook -u username -i "new.server.example.com," --key-file ~/.ssh/id_ed25519 -k -K --extra-vars "firewall_ip=192.0.2.123" freebsd.yml
+- name: Initial server configuration
+  hosts: all
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Configuration
+      become_method: ansible.builtin.su
+      block:
+        - name: Set pkg repo to latest
+          ansible.builtin.raw:
+            "mkdir -p /usr/local/etc/pkg/repos ; sed s@quarterly@latest@g < /etc/pkg/FreeBSD.conf > /usr/local/etc/pkg/repos/FreeBSD.conf"
+          changed_when: false
+
+        - name: Bootstrap pkg and update
+          ansible.builtin.raw: "pkg bootstrap -y && pkg update"
+          changed_when: false
+
+        - name: Install Python
+          ansible.builtin.raw: "pkg install -y python311"
+          changed_when: false
+
+        - name: Gather facts
+          ansible.builtin.setup:
+
+        - name: Fetch FreeBSD updates
+          ansible.builtin.shell: "freebsd-update fetch"
+          register: result_update
+          changed_when: "'No updates needed' not in result_update.stdout"
+
+        - name: Install FreeBSD updates
+          ansible.builtin.shell: "freebsd-update install"
+          when: result_update.changed
+
+        - name: Install software
+          community.general.pkgng:
+            name: "{{ item.name }}"
+            state: present
+          with_items:
+            - { name: "sudo" }
+            - { name: "qemu-guest-agent" }
+
+        - name: Configure pf
+          ansible.builtin.copy:
+            content: |
+              # Macros
+              ext_if = "{{ ansible_default_ipv4.interface }}"
+              ssh = "{ {{ firewall_ip }} }"
+
+              ##
+
+              set block-policy return         # Send TCP RST/ICMP UNREACH instead of silently dropping packets
+              set loginterface $ext_if        # Enable collection of packet and byte count statistics
+              set skip on lo                  # No filtering on loopback interface
+
+              # These might not be necessary at all
+              scrub in no-df random-id
+
+              # Block all ingress traffic by default
+              block return all
+
+              # Allow certain types of ICMP. The good types.
+              # http://shouldiblockicmp.com
+              pass in quick on $ext_if inet proto icmp icmp-type { echorep, echoreq, unreach, timex } keep state
+              pass in quick on $ext_if inet6 proto ipv6-icmp from any to { ($ext_if), ff02::1/16 } icmp6-type { toobig, timex, echoreq, echorep, routersol, routeradv, neighbrsol, neighbradv, redir } keep state
+
+              # Allow external connections
+              pass in quick on $ext_if proto tcp from $ssh to ($ext_if) port ssh flags S/SA keep state
+
+              # Always allow outgoing traffic
+              pass out quick all keep state
+            dest: "/etc/pf.conf"
+            owner: root
+            group: wheel
+            mode: "0600"
+
+        - name: Configure sudo
+          ansible.builtin.copy:
+            content: "%wheel ALL=(ALL:ALL) NOPASSWD: ALL"
+            dest: "/usr/local/etc/sudoers.d/local_settings"
+            owner: root
+            group: wheel
+            mode: "0600"
+
+        - name: Configure sshd
+          ansible.builtin.lineinfile:
+            path: "/etc/ssh/sshd_config"
+            regexp: "{{ item.regexp }}"
+            line: "{{ item.line }}"
+          with_items:
+            - { regexp: "#AllowAgentForwarding yes", line: "AllowAgentForwarding no" }
+            - { regexp: "#AllowTcpForwarding", line: "AllowTcpForwarding no" }
+            - { regexp: "#KbdInteractiveAuthentication", line: "KbdInteractiveAuthentication no" }
+            - { regexp: "#UseDNS", line: "UseDNS no" }
+            - { regexp: "#PasswordAuthentication", line: "PasswordAuthentication no" }
+            - { regexp: "#PermitRootLogin", line: "PermitRootLogin no" }
+            - { regexp: "#PrintMotd", line: "PrintMotd no" }
+            - { regexp: "#VersionAddendum", line: "VersionAddendum none" }
+            - { regexp: "#X11Forwarding", line: "X11Forwarding no" }
+
+        - name: Upload SSH keys
+          ansible.posix.authorized_key:
+            user: "{{ ansible_ssh_user }}"
+            state: present
+            exclusive: true
+            key: "{{ item.key }}"
+          with_items:
+            - { key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIjJlV/8ZzrnDJtB/KxU72oJzgDBHK0qcBqHY9rNkQjT johan@mbp.local" }
+
+        - name: Enable services
+          community.general.sysrc:
+            name: "{{ item.name }}"
+            value: "YES"
+          with_items:
+            - { name: "ntpd_enable" }
+            - { name: "ntpd_sync_on_start" }
+            - { name: "pf_enable" }
+            - { name: "pflog_enable" }
+            - { name: "qemu_guest_agent_enable" }
+
+        - name: Generate and save password for local user
+          ansible.builtin.set_fact:
+            user_password: "{{
+                lookup('ansible.builtin.password', 'creds_user.txt', chars=['ascii_letters', 'digits'], length=16) }}"
+
+        - name: Change user password
+          ansible.builtin.user:
+            name: "{{ ansible_ssh_user }}"
+            state: present
+            password: "{{ user_password | trim | password_hash('sha512') }}"
+
+        - name: Generate and save password for root user
+          ansible.builtin.set_fact:
+            root_password: "{{
+                lookup('ansible.builtin.password', 'creds_root.txt', chars=['ascii_letters', 'digits'], length=16) }}"
+
+        - name: Change root password
+          ansible.builtin.user:
+            name: root
+            state: present
+            password: "{{ root_password | trim | password_hash('sha512') }}"
+
+    - name: Reboot
+      become_method: ansible.builtin.sudo
+      block:
+        - name: Set sudo password
+          ansible.builtin.set_fact:
+            ansible_become_password: "{{ user_password }}"
+
+        - name: Reset the ssh connection (logging out/in) to apply new user settings
+          ansible.builtin.meta:
+            reset_connection
+
+        - name: Reboot
+          ansible.builtin.reboot:
+            msg: "Reboot after initial server configuration"
+
+# vim: ft=yaml.ansible
